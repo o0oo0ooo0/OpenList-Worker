@@ -28,7 +28,8 @@ export function generateWebDavXml(
 
   // Children
   for (const item of items) {
-    const itemHref = `${path}${path.endsWith("/") ? "" : "/"}${encodeURIComponent(item.name)}`
+    // 目录 href 补尾部斜杠（RFC 4918 §5.2 SHOULD，对齐 Go 版 IsDir 逻辑）
+    const itemHref = `${path}${path.endsWith("/") ? "" : "/"}${encodeURIComponent(item.name)}${item.isFolder ? "/" : ""}`
     xml += `  <d:response>\n`
     xml += `    <d:href>${itemHref}</d:href>\n`
     xml += `    <d:propstat>\n`

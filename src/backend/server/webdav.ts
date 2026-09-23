@@ -131,12 +131,14 @@ webdavRouter.all("/*", async (c) => {
           isFolder: !!it.is_dir,
           modified: it.modified || new Date().toISOString(),
         }))
+        // RFC 4918：href 必须是资源的外部 URL 路径（含 /dav 前缀）。
+        // rclone 会校验 href 是否位于 WebDAV 根 URL 之下，缺前缀会报
+        // "Item with unknown path received"。对齐 Go 版：
+        // href = path.Join(h.Prefix, reqPath)，目录补尾部斜杠。
         const href =
           davPath === "/"
-            ? "/"
-            : davPath.endsWith("/")
-              ? davPath
-              : davPath + "/"
+            ? "/dav/"
+            : "/dav" + (davPath.endsWith("/") ? davPath : davPath + "/")
         const xml = buildWebDavPropfindResponse(href, items)
         return c.body(xml, depth === "0" ? 207 : 207, {
           "Content-Type": "application/xml; charset=utf-8",
