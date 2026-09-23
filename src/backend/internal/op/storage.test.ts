@@ -4,10 +4,12 @@ import { test } from "node:test"
 import type { StorageDriver } from "../driver/base"
 import { getDb, saveDb } from "../model/db"
 import {
+  getDriver,
   getItem,
   getOrCreateDriver,
   scheduleStoragePersistence,
 } from "./storage"
+import { Cloud189PCDriver } from "../../drivers/189pc/driver"
 
 test("concurrent driver initialization shares one Promise", async () => {
   let calls = 0
@@ -77,4 +79,33 @@ test("mounted storage roots return without initializing the remote driver", asyn
   assert.equal(result.item.name, "189")
   assert.equal(result.item.is_dir, true)
   assert.equal(result.item.sign, "-11")
+})
+
+test("189CloudPC 路由到天翼云盘客户端驱动（而非 Web 版 189）", async () => {
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = (async () =>
+    new Response(
+      JSON.stringify({ res_code: 0, sessionKey: "sk", sessionSecret: "ss" }),
+      { status: 200, headers: { "content-type": "application/json" } },
+    )) as typeof fetch
+
+  try {
+    for (const alias of ["189CloudPC", "189pc", "cloud189pc"]) {
+      const driver = await getDriver(alias, {
+        id: `pc-${alias}`,
+        driver: alias,
+        addition: JSON.stringify({
+          username: "13800138000",
+          password: "secret",
+          access_token: "at",
+        }),
+      })
+      assert.ok(
+        driver instanceof Cloud189PCDriver,
+        `驱动别名 ${alias} 应路由到 Cloud189PCDriver`,
+      )
+    }
+  } finally {
+    globalThis.fetch = originalFetch
+  }
 })

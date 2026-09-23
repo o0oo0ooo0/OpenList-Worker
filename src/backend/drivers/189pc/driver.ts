@@ -1,53 +1,64 @@
-// 189PC driver - China Telecom Cloud PC Protocol
+// 天翼云盘客户端（189CloudPC）驱动 —— Cloudflare Workers 适配版
 // Ported from: https://github.com/OpenListTeam/OpenList/tree/main/drivers/189pc
+//
+// 与 Go 版驱动的能力对照：
+//   - 支持个人云 / 家庭云（family）两种视图；
+//   - 支持账号密码登录，以及 access_token / refresh_token 续期；
+//   - List / Get / Mkdir / Rename / Move / Copy / Remove / Put 全量实现；
+//   - 家庭云转存（family_transfer）、迅雷下载插件、torrent 追随等 Go 版高级特性暂不支持。
+
 import {
-  StorageDriver,
   FileItem,
+  StorageDriver,
   calcFileType,
 } from "../../internal/driver/base"
 import { sortFileItems } from "../../internal/driver/sort"
-import {
+import { md5Hex } from "../189/crypto"
+import { DEFAULT_ROOT_ID, SUBREQUEST_LIMIT } from "./consts"
+import type {
   Cloud189PCAddition,
   Cloud189PCFile,
-  Cloud189PCListResp,
-  Cloud189PCLoginResp,
-  Cloud189PCInitMultiUploadResp,
-  Cloud189PCUploadUrlResp,
+  Cloud189PCFolder,
+  Cloud189PCObject,
+  PersistedTokens,
+  UploadSession,
 } from "./types"
-import { Cloud189PCClient, calcMD5, calcSHA1 } from "./util"
-import { encryptPassword, generateDeviceId } from "./crypto"
 import {
-  LoginURL,
-  ListFilesURL,
-  CreateFolderURL,
-  RenameFileURL,
-  DeleteFileURL,
-  GetDownloadURLURL,
-  InitUploadURL,
-  GetUploadURLsURL,
-  CommitUploadURL,
-  DefaultChunkSize,
-} from "./consts"
+  Cloud189PCClient,
+  parse189PCTime,
+  parseHttpHeader,
+  partSize,
+} from "./util"
 
-function parse189PCDate(dateStr: string): string {
-  if (!dateStr) return new Date().toISOString()
-  try {
-    const d = new Date(dateStr)
-    if (!isNaN(d.getTime())) return d.toISOString()
-  } catch {}
-  return new Date().toISOString()
+/** 189 会把单引号转义成 \'，展示时需要还原 */
+function normalizeName(name: string): string {
+  return (name || "").replace(/\\'/g, "'")
 }
 
-function cloud189PCFileToFileItem(file: Cloud189PCFile): FileItem {
+function toFileItem(obj: Cloud189PCObject): FileItem {
+  if (obj.isFolder) {
+    const folder = obj as Cloud189PCFolder
+    return {
+      name: normalizeName(folder.name),
+      size: 0,
+      is_dir: true,
+      modified: parse189PCTime(folder.lastOpTime || folder.createDate),
+      sign: folder.id,
+      type: 1,
+      thumb: "",
+      raw_url: "",
+    }
+  }
+  const file = obj as Cloud189PCFile
   return {
-    name: file.name,
-    size: file.size || 0,
-    is_dir: file.isFolder,
-    modified: parse189PCDate(file.lastOpTime || file.createDate),
-    sign: file.id.toString(),
-    type: calcFileType(file.name, file.isFolder),
+    name: normalizeName(file.name),
+    size: Number(file.size) || 0,
+    is_dir: false,
+    modified: parse189PCTime(file.lastOpTime || file.createDate),
+    sign: file.id,
+    type: calcFileType(file.name, false),
     thumb: file.icon?.smallUrl || file.icon?.largeUrl || "",
-    raw_url: file.downloadUrl || "",
+    raw_url: "",
     hash: file.md5 || undefined,
     hashes: file.md5 ? { md5: file.md5 } : undefined,
   }
@@ -55,241 +66,300 @@ function cloud189PCFileToFileItem(file: Cloud189PCFile): FileItem {
 
 export function normalizeCloud189PCAddition(a: any): Cloud189PCAddition {
   const norm = { ...(a || {}) } as any
-  norm.username = (norm.username || "").trim()
-  norm.password = (norm.password || "").trim()
-  norm.root_folder_id = norm.root_folder_id || "-11"
-  norm.captcha_mode = norm.captcha_mode || ""
-  norm.device_id = norm.device_id || ""
-  norm.session_key = norm.session_key || ""
-  norm.session_secret = norm.session_secret || ""
-  norm.login_type = norm.login_type || "1"
+  norm.username = String(norm.username || "").trim()
+  norm.password = String(norm.password || "").trim()
+  norm.validate_code = String(norm.validate_code || "").trim()
+  norm.access_token = String(norm.access_token || "").trim()
+  norm.refresh_token = String(norm.refresh_token || "").trim()
+  norm.login_type = norm.login_type || "password"
+  norm.type = norm.type === "family" ? "family" : "personal"
+  norm.family_id = String(norm.family_id || "").trim()
+  norm.order_by = norm.order_by || "filename"
+  norm.order_direction = norm.order_direction || "asc"
+  norm.upload_method = norm.upload_method || "stream"
+
+  // 家庭云根目录没有 -11，个人云必须显式使用 -11
+  if (norm.type === "family") {
+    if (!norm.root_folder_id || norm.root_folder_id === DEFAULT_ROOT_ID) {
+      norm.root_folder_id = ""
+    }
+  } else if (!norm.root_folder_id) {
+    norm.root_folder_id = DEFAULT_ROOT_ID
+  }
+
+  const thread = Number(norm.upload_thread)
+  norm.upload_thread =
+    Number.isInteger(thread) && thread >= 1 && thread <= 32
+      ? String(thread)
+      : "3"
   return norm as Cloud189PCAddition
+}
+
+function encodeSession(session: UploadSession): string {
+  const bytes = new TextEncoder().encode(JSON.stringify(session))
+  let binary = ""
+  for (let i = 0; i < bytes.length; i++) {
+    binary += String.fromCharCode(bytes[i])
+  }
+  return btoa(binary)
+}
+
+function decodeSession(token: string): UploadSession {
+  try {
+    const binary = atob(token)
+    const bytes = new Uint8Array(binary.length)
+    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i)
+    const session = JSON.parse(new TextDecoder().decode(bytes)) as UploadSession
+    if (
+      !session?.uploadFileId ||
+      !Number.isInteger(session.partCount) ||
+      session.partCount < 1
+    ) {
+      throw new Error("invalid session")
+    }
+    return session
+  } catch {
+    throw new Error("[189PC] 上传会话无效或已损坏")
+  }
+}
+
+function segmentsOf(path: string): string[] {
+  return String(path || "")
+    .split("/")
+    .filter(Boolean)
+}
+
+function maybeDecode(raw: string): string {
+  try {
+    return decodeURIComponent(raw)
+  } catch {
+    return raw
+  }
+}
+
+function toBytes(buffer: Buffer): Uint8Array {
+  return new Uint8Array(
+    buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.length),
+  )
 }
 
 export class Cloud189PCDriver implements StorageDriver {
   private client: Cloud189PCClient
   private addition: Cloud189PCAddition
-  private rootFolderId: string = "-11"
-  private onTokenUpdate?: (tokens: {
-    session_key: string
-    session_secret: string
-    device_id: string
-  }) => Promise<void>
+  /** physicalPath -> folderId 缓存 */
+  private pathIdCache = new Map<string, string>()
+  /** Cloudflare Workers 单次请求的子请求预算 */
+  private budget = { used: 0, limit: SUBREQUEST_LIMIT }
+
+  constructor(
+    addition: Cloud189PCAddition,
+    persistTokens?: (tokens: PersistedTokens) => void | Promise<void>,
+  ) {
+    this.addition = normalizeCloud189PCAddition(addition)
+    this.client = new Cloud189PCClient(this.addition, persistTokens)
+  }
+
+  async init(): Promise<void> {
+    await this.client.init()
+  }
 
   get config() {
     return {
-      name: "189PC",
+      name: "189CloudPC",
       localSort: false,
       onlyLocal: false,
       onlyProxy: false,
       noCache: false,
       noUpload: false,
-      defaultRoot: "-11",
+      defaultRoot: this.addition.root_folder_id || DEFAULT_ROOT_ID,
     }
   }
 
-  constructor(
-    addition: any,
-    onTokenUpdate?: (tokens: {
-      session_key: string
-      session_secret: string
-      device_id: string
-    }) => Promise<void>
-  ) {
-    this.addition = normalizeCloud189PCAddition(addition)
-    this.client = new Cloud189PCClient(this.addition)
-    this.rootFolderId = this.addition.root_folder_id || "-11"
-    this.onTokenUpdate = onTokenUpdate
-  }
+  // ------------------------------------------------------------ 路径解析
 
-  async init(): Promise<void> {
-    // Check if we have valid session
-    if (this.addition.session_key && this.addition.session_secret) {
-      // Try to use existing session
-      try {
-        await this.testSession()
-        return
-      } catch (e) {
-        // Session expired, need to login again
-      }
-    }
+  private async resolveFolderId(physicalPath: string): Promise<string> {
+    const rootId = this.addition.root_folder_id ?? DEFAULT_ROOT_ID
+    const clean = "/" + segmentsOf(physicalPath).join("/")
+    if (clean === "/" || clean === `/${rootId}`) return rootId
 
-    // Generate device ID if not provided
-    if (!this.client.getDeviceId()) {
-      this.client.setDeviceId(generateDeviceId())
-    }
+    const segs = segmentsOf(physicalPath)
+    let parentId = rootId
+    let cachedLen = 0
 
-    // Login
-    await this.login()
-  }
-
-  private async testSession(): Promise<void> {
-    // Test session by listing root folder
-    await this.client.requestAPI(ListFilesURL, {
-      folderId: this.rootFolderId,
-      pageNum: 1,
-      pageSize: 1,
-    })
-  }
-
-  private async login(): Promise<void> {
-    // Get RSA public key
-    const params = {
-      appId: "600002434",
-      accountType: this.addition.login_type || "1",
-      userName: this.addition.username,
-      password: encryptPassword(this.addition.password, await this.getRSAPublicKey()),
-      clientType: "10020",
-      returnUrl: "https://m.cloud.189.cn/zhuanti/2020/loginSuccess/index.html",
-      mailSuffix: "@189.cn",
-    }
-
-    const resp = await this.client.request(LoginURL, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/x-www-form-urlencoded",
-      },
-      body: new URLSearchParams(params).toString(),
-    })
-
-    if (!resp || resp.result !== 0) {
-      throw new Error(`Login failed: ${resp?.msg || "Unknown error"}`)
-    }
-
-    const loginResp = resp as Cloud189PCLoginResp
-    this.client.setTokens(
-      loginResp.accessToken,
-      loginResp.sessionKey,
-      loginResp.sessionSecret
-    )
-
-    // Notify token update
-    if (this.onTokenUpdate) {
-      await this.onTokenUpdate({
-        session_key: loginResp.sessionKey,
-        session_secret: loginResp.sessionSecret,
-        device_id: this.client.getDeviceId(),
-      })
-    }
-  }
-
-  private async getRSAPublicKey(): Promise<string> {
-    // Cloud189 uses a fixed RSA public key for PC protocol
-    return "MIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQDY7mpaUysvgQkIiL9M6PxYcKGOXe0elNAk" +
-           "kkh/v0fzfx6cGrJnLlh5G0H8qPUvhLHh+U4xqRMN8C7KKKHmCQ1Xq5KLJCBM6pq9W2KU2R1q" +
-           "g5SrCAqHq5KXJHM7TpjD/yH0u8KpY2H5U3WwR5N9LCdTw2XP6YqOvAx8kKqM3N8mKQIDAQAB"
-  }
-
-  async drop(): Promise<void> {
-    // No cleanup needed
-  }
-
-  async list(dir: string): Promise<FileItem[]> {
-    const folderId = dir || this.rootFolderId
-    const allFiles: FileItem[] = []
-    let pageNum = 1
-    const pageSize = 100
-
-    while (true) {
-      const resp = await this.client.requestAPI(ListFilesURL, {
-        folderId,
-        pageNum,
-        pageSize,
-      })
-
-      const listResp = resp as Cloud189PCListResp
-
-      // Add folders
-      if (listResp.folderList) {
-        for (const folder of listResp.folderList) {
-          allFiles.push(cloud189PCFileToFileItem(folder))
-        }
-      }
-
-      // Add files
-      if (listResp.fileList) {
-        for (const file of listResp.fileList) {
-          allFiles.push(cloud189PCFileToFileItem(file))
-        }
-      }
-
-      // Check if we have more pages
-      if (allFiles.length >= listResp.recordCount) {
+    for (let i = 0; i < segs.length; i++) {
+      const prefix = "/" + segs.slice(0, i + 1).join("/")
+      const cached = this.pathIdCache.get(prefix)
+      if (cached !== undefined) {
+        parentId = cached
+        cachedLen = i + 1
+      } else {
         break
       }
-      pageNum++
     }
 
-    return sortFileItems(allFiles, "name", "asc")
+    for (let i = cachedLen; i < segs.length; i++) {
+      const rawName = segs[i]
+      const decodedName = maybeDecode(rawName)
+      const objects = await this.client.getFiles(parentId)
+      const folder = objects.find(
+        (obj) =>
+          obj.isFolder &&
+          (obj.name === rawName ||
+            obj.name === decodedName ||
+            String(obj.id) === rawName ||
+            String(obj.id) === decodedName),
+      )
+      if (!folder) throw new Error(`[189PC] 目录未找到: ${rawName}`)
+      parentId = String(folder.id)
+      this.pathIdCache.set("/" + segs.slice(0, i + 1).join("/"), parentId)
+    }
+
+    return parentId
   }
 
-  async link(file: FileItem): Promise<{ url: string; headers?: Record<string, string> }> {
-    if (file.is_dir) {
-      throw new Error("Cannot get link for directory")
-    }
+  private async resolveObject(physicalPath: string): Promise<{
+    object: Cloud189PCObject
+    parentId: string
+    isDir: boolean
+  }> {
+    const segs = segmentsOf(physicalPath)
+    if (segs.length === 0) throw new Error("[189PC] 路径无效")
 
-    const resp = await this.client.requestAPI(GetDownloadURLURL, {
-      fileId: file.sign,
-    })
+    const rawName = segs[segs.length - 1]
+    const decodedName = maybeDecode(rawName)
+    const parentId = await this.resolveFolderId(
+      "/" + segs.slice(0, -1).join("/"),
+    )
+    const objects = await this.client.getFiles(parentId)
 
-    if (!resp || !resp.fileDownloadUrl) {
-      throw new Error("Failed to get download URL")
-    }
+    const matched = objects.find(
+      (obj) =>
+        obj.name === rawName ||
+        obj.name === decodedName ||
+        String(obj.id) === rawName ||
+        String(obj.id) === decodedName,
+    )
+    if (!matched) throw new Error(`[189PC] 文件或目录未找到: ${rawName}`)
+    return { object: matched, parentId, isDir: matched.isFolder }
+  }
 
-    return {
-      url: resp.fileDownloadUrl,
+  private orderByKey(): string {
+    switch (this.addition.order_by) {
+      case "filesize":
+        return "size"
+      case "lastOpTime":
+        return "modified"
+      default:
+        return "name"
     }
+  }
+
+  // ------------------------------------------------------------ StorageDriver
+
+  async list(_virtualPath: string, physicalPath: string): Promise<FileItem[]> {
+    this.budget.used = 0
+    const folderId = await this.resolveFolderId(physicalPath)
+    const objects = await this.client.getFiles(folderId)
+    return sortFileItems(
+      objects.map(toFileItem),
+      this.orderByKey(),
+      this.addition.order_direction === "desc" ? "desc" : "asc",
+    )
   }
 
   async get(_virtualPath: string, physicalPath: string): Promise<FileItem> {
-    const resp = await this.client.requestAPI("/open/file/getFileInfo.action", {
-      fileId: physicalPath,
-    })
+    this.budget.used = 0
+    const segs = segmentsOf(physicalPath)
+    const rootId = this.addition.root_folder_id ?? DEFAULT_ROOT_ID
+    if (segs.length === 0 || segs[segs.length - 1] === rootId) {
+      return {
+        name: rootId,
+        size: 0,
+        is_dir: true,
+        modified: new Date().toISOString(),
+        sign: rootId,
+        type: 1,
+        thumb: "",
+        raw_url: "",
+      }
+    }
 
-    if (!resp) throw new Error("[189PC] file not found")
-
-    return cloud189PCFileToFileItem(resp as Cloud189PCFile)
+    const { object } = await this.resolveObject(physicalPath)
+    const item = toFileItem(object)
+    if (!item.is_dir) {
+      try {
+        item.raw_url = await this.client.getFileDownloadUrl(item.sign)
+        item.raw_url_headers = this.client.getDownloadHeaders()
+      } catch (e: any) {
+        console.warn(`[189PC] 获取 ${item.name} 下载地址失败:`, e?.message)
+        item.raw_url_error = e?.message || "获取下载地址失败"
+      }
+    }
+    return item
   }
 
   async mkdir(_virtualPath: string, physicalPath: string): Promise<void> {
-    const parts = physicalPath.split("/").filter(Boolean)
-    const dirName = parts.pop() || ""
-    const parentDir = parts.join("/")
-    const resp = await this.client.requestAPI(CreateFolderURL, {
-      parentFolderId: parentDir || this.rootFolderId,
-      folderName: dirName,
-    })
-
-    if (!resp || resp.id === undefined) {
-      throw new Error("Failed to create folder")
-    }
+    this.budget.used = 0
+    const segs = segmentsOf(physicalPath)
+    const dirName = segs.pop() || "新文件夹"
+    const parentId = await this.resolveFolderId("/" + segs.join("/"))
+    await this.client.mkdir(parentId, dirName)
   }
 
-  async move(srcPath: string, dstDirPath: string): Promise<void> {
-    // 189PC doesn't have a direct move API, use copy + delete
-    await this.copy(srcPath, dstDirPath)
-    await this.remove(srcPath)
+  async rename(
+    _virtualPath: string,
+    physicalPath: string,
+    newName: string,
+  ): Promise<void> {
+    this.budget.used = 0
+    const { object } = await this.resolveObject(physicalPath)
+    await this.client.rename(String(object.id), object.isFolder, newName)
   }
 
-  async rename(srcPath: string, newName: string): Promise<void> {
-    await this.client.requestAPI(RenameFileURL, {
-      fileId: srcPath,
-      fileName: newName,
-    })
+  async remove(
+    _virtualPath: string,
+    physicalPath: string,
+    _names: string[],
+  ): Promise<void> {
+    this.budget.used = 0
+    const { object } = await this.resolveObject(physicalPath)
+    await this.client.remove(String(object.id), object.name, object.isFolder)
   }
 
-  async copy(srcPath: string, dstDirPath: string): Promise<void> {
-    // Use internal copy API
-    await this.client.requestAPI("/open/file/copyFile.action", {
-      fileId: srcPath,
-      destFolderId: dstDirPath || this.rootFolderId,
-    })
+  async move(
+    _srcDir: string,
+    dstDir: string,
+    _names: string[],
+    srcPhysical: string,
+    _dstPhysical: string,
+  ): Promise<void> {
+    this.budget.used = 0
+    const { object } = await this.resolveObject(srcPhysical)
+    const targetId = await this.resolveFolderId(dstDir)
+    await this.client.move(
+      String(object.id),
+      object.name,
+      object.isFolder,
+      targetId,
+    )
   }
 
-  async remove(path: string): Promise<void> {
-    await this.client.requestAPI(DeleteFileURL, {
-      fileId: path,
-    })
+  async copy(
+    _srcDir: string,
+    dstDir: string,
+    _names: string[],
+    srcPhysical: string,
+    _dstPhysical: string,
+  ): Promise<void> {
+    this.budget.used = 0
+    const { object } = await this.resolveObject(srcPhysical)
+    const targetId = await this.resolveFolderId(dstDir)
+    await this.client.copy(
+      String(object.id),
+      object.name,
+      object.isFolder,
+      targetId,
+    )
   }
 
   async put(
@@ -297,59 +367,208 @@ export class Cloud189PCDriver implements StorageDriver {
     physicalPath: string,
     content: Buffer,
   ): Promise<void> {
-    const pathParts = physicalPath.split("/").filter(Boolean)
-    const fileName = pathParts.pop() || "upload"
-    const parentFolderId = pathParts.join("/") || this.rootFolderId
-    const buffer = content
-    const totalSize = content.length
-    const md5 = calcMD5(buffer)
-    const sha1 = calcSHA1(buffer)
+    const segs = segmentsOf(physicalPath)
+    const fileName = segs.pop()
+    if (!fileName) throw new Error("[189PC] 上传路径无效")
+    const parentId = await this.resolveFolderId("/" + segs.join("/"))
+    await this.uploadWholeFile(parentId, fileName, toBytes(content))
+  }
 
-    // Init upload
-    const initResp = await this.client.requestUploadAPI(InitUploadURL, {
-      parentFolderId,
+  // ------------------------------------------------------------ 上传实现
+
+  /**
+   * Worker 侧 put 收到的是完整内容，可以直接算出整文件 md5 与分片校验值，
+   * 走「一次 init + 逐片 PUT + commit」（等价于 Go 版 StreamUpload）。
+   */
+  private async uploadWholeFile(
+    parentId: string,
+    fileName: string,
+    content: Uint8Array,
+  ): Promise<void> {
+    const size = content.length
+    const sliceSize = partSize(size)
+    const partCount = Math.max(1, Math.ceil(size / sliceSize))
+    const fileMd5 = md5Hex(content).toUpperCase()
+
+    const partMd5s: string[] = []
+    for (let i = 1; i <= partCount; i++) {
+      const start = (i - 1) * sliceSize
+      const chunk = content.subarray(start, Math.min(start + sliceSize, size))
+      partMd5s.push(md5Hex(chunk).toUpperCase())
+    }
+    const sliceMd5 =
+      partCount > 1 ? md5Hex(partMd5s.join("\n")).toUpperCase() : fileMd5
+
+    const extra: Record<string, string> = {
+      fileMd5,
+      sliceMd5,
+      lazyCheck: "1",
+      opertype: "3",
+    }
+    if (this.client.isFamily()) extra.familyId = this.client.getFamilyId()
+
+    const init = await this.client.initMultiUpload(
+      parentId,
       fileName,
-      fileSize: totalSize,
-      fileMd5: md5,
-      sliceSize: DefaultChunkSize,
-      lazyCheck: 1,
-    })
+      size,
+      sliceSize,
+      extra,
+    )
 
-    const uploadResp = initResp as Cloud189PCInitMultiUploadResp
-
-    // Check if file already exists (quick upload)
-    if (uploadResp.fileDataExists === 1) {
-      return
+    if (init.fileDataExists !== 1) {
+      for (let i = 1; i <= partCount; i++) {
+        const start = (i - 1) * sliceSize
+        const chunk = content.subarray(start, Math.min(start + sliceSize, size))
+        const partInfo = this.client.partInfoOf(i, chunk)
+        const target = await this.client.getUploadUrls(
+          init.uploadFileId,
+          i,
+          partInfo,
+        )
+        await this.client.uploadPartRaw(
+          target.requestURL!,
+          parseHttpHeader(target.requestHeader),
+          chunk,
+        )
+      }
     }
 
-    // Get upload URLs
-    const urlResp = await this.client.requestUploadAPI(GetUploadURLsURL, {
-      uploadFileId: uploadResp.uploadFileId,
-      partInfo: JSON.stringify([{ partNumber: 1 }]),
-    })
-
-    const uploadUrlResp = urlResp as Cloud189PCUploadUrlResp
-
-    if (!uploadUrlResp.uploadUrls || uploadUrlResp.uploadUrls.length === 0) {
-      throw new Error("Failed to get upload URLs")
-    }
-
-    // Upload file
-    const formData = new FormData()
-    formData.append("file", new Blob([buffer as unknown as BlobPart]), fileName)
-
-    await this.client.request(uploadUrlResp.uploadUrls[0], {
-      method: "POST",
-      body: formData,
-    })
-
-    // Commit upload
-    await this.client.requestUploadAPI(CommitUploadURL, {
-      uploadFileId: uploadResp.uploadFileId,
+    await this.client.commitMultiUpload(init.uploadFileId, {
+      fileMd5,
+      sliceMd5,
+      lazyCheck: "1",
+      opertype: "3",
     })
   }
 
-  async other(_method: string, _data: Record<string, any>): Promise<any> {
-    throw new Error(`Unsupported operation: ${_method}`)
+  /** 服务层 /fs/multipart/* 使用的三段式分片上传 */
+  async createUploadSession(
+    _virtualDir: string,
+    physicalDir: string,
+    fileName: string,
+    size: number,
+    md5: string,
+  ): Promise<{
+    reuse: boolean
+    requiresMd5?: boolean
+    partCount: number
+    chunkSize: number
+    session: string
+  }> {
+    const totalSize = Math.max(0, Number(size) || 0)
+    const sliceSize = partSize(totalSize)
+    const normalizedMd5 = String(md5 || "")
+      .trim()
+      .toLowerCase()
+    if (!/^[a-f0-9]{32}$/.test(normalizedMd5)) {
+      // initMultiUpload 需要整体 md5 才能做秒传与校验，让前端先算好 md5 再重试，
+      // 避免 Worker 侧缓冲整个文件。
+      return {
+        reuse: false,
+        requiresMd5: true,
+        partCount: 0,
+        chunkSize: sliceSize,
+        session: "",
+      }
+    }
+
+    const fileMd5 = normalizedMd5.toUpperCase()
+    const partCount = Math.max(1, Math.ceil(totalSize / sliceSize))
+    const parentId = await this.resolveFolderId(physicalDir || "/")
+    const extra: Record<string, string> = {
+      fileMd5,
+      lazyCheck: "1",
+      opertype: "3",
+    }
+    if (this.client.isFamily()) extra.familyId = this.client.getFamilyId()
+
+    const init = await this.client.initMultiUpload(
+      parentId,
+      fileName,
+      totalSize,
+      sliceSize,
+      extra,
+    )
+
+    const commitExtra = {
+      fileMd5,
+      sliceMd5: fileMd5,
+      lazyCheck: "1",
+      opertype: "3",
+    }
+    if (init.fileDataExists === 1) {
+      await this.client.commitMultiUpload(init.uploadFileId, commitExtra)
+      return { reuse: true, partCount: 0, chunkSize: sliceSize, session: "" }
+    }
+
+    return {
+      reuse: false,
+      partCount,
+      chunkSize: sliceSize,
+      session: encodeSession({
+        uploadFileId: init.uploadFileId,
+        fileMd5,
+        size: totalSize,
+        partCount,
+        sliceSize,
+        isFamily: this.client.isFamily(),
+        familyId: this.client.getFamilyId(),
+      }),
+    }
+  }
+
+  async uploadPart(
+    sessionToken: string,
+    partNumber: number,
+    content: Buffer,
+  ): Promise<{ partMd5: string }> {
+    const session = decodeSession(sessionToken)
+    if (
+      !Number.isInteger(partNumber) ||
+      partNumber < 1 ||
+      partNumber > session.partCount
+    ) {
+      throw new Error(`[189PC] 分片序号无效: ${partNumber}`)
+    }
+    const bytes = toBytes(content)
+    const partInfo = this.client.partInfoOf(partNumber, bytes)
+    const target = await this.client.getUploadUrls(
+      session.uploadFileId,
+      partNumber,
+      partInfo,
+    )
+    await this.client.uploadPartRaw(
+      target.requestURL!,
+      parseHttpHeader(target.requestHeader),
+      bytes,
+    )
+    return { partMd5: md5Hex(bytes).toLowerCase() }
+  }
+
+  async completeUploadSession(
+    sessionToken: string,
+    partMd5s: string[] = [],
+  ): Promise<void> {
+    const session = decodeSession(sessionToken)
+    const normalized = partMd5s
+      .map((part) =>
+        String(part || "")
+          .trim()
+          .toUpperCase(),
+      )
+      .filter((part) => /^[A-F0-9]{32}$/.test(part))
+    if (normalized.length !== session.partCount) {
+      throw new Error("[189PC] 分片校验信息不完整，无法提交上传")
+    }
+    const sliceMd5 =
+      session.partCount === 1
+        ? session.fileMd5
+        : md5Hex(normalized.join("\n")).toUpperCase()
+    await this.client.commitMultiUpload(session.uploadFileId, {
+      fileMd5: session.fileMd5,
+      sliceMd5,
+      lazyCheck: "1",
+      opertype: "3",
+    })
   }
 }

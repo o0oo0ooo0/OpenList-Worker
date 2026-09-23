@@ -45,6 +45,7 @@ import {
 } from "../../drivers/thunder/driver"
 import { LanzouDriver } from "../../drivers/lanzou/driver"
 import { Cloud189Driver } from "../../drivers/189/driver"
+import { Cloud189PCDriver } from "../../drivers/189pc/driver"
 import { Driver189TV } from "../../drivers/189_tv/driver"
 import { WebdavDriver } from "../../drivers/webdav/driver"
 import { WoPanDriver, normalizeWoPanAddition } from "../../drivers/wopan/driver"
@@ -737,12 +738,46 @@ async function createDriver(
     })
     await driver.init?.()
   } else if (
+    normDriver === "189pc" ||
+    normDriver === "189cloudpc" ||
+    normDriver === "cloud189pc" ||
+    normDriver === "189pcloud" ||
+    normDriver === "189pcclient" ||
+    normDriver === "189client" ||
+    normDriver === "ctyunpc"
+  ) {
+    // 天翼云盘客户端（PC 协议）：与 Web 版 189 是不同的协议实现
+    const addition = parseAddition(storageConfig)
+    driver = new Cloud189PCDriver(
+      addition,
+      async (tokens: { access_token: string; refresh_token: string }) => {
+        try {
+          const db = await getDb()
+          const st = (db.storages || []).find(
+            (s: any) => s.id === storageConfig?.id,
+          )
+          if (!st) return
+          const stAddition =
+            typeof st.addition === "string"
+              ? JSON.parse(st.addition || "{}")
+              : st.addition || {}
+          if (tokens.access_token) stAddition.access_token = tokens.access_token
+          if (tokens.refresh_token)
+            stAddition.refresh_token = tokens.refresh_token
+          st.addition = JSON.stringify(stAddition)
+          await saveDb(db)
+        } catch (e) {
+          console.warn("[189PC] failed to persist tokens:", e)
+        }
+      },
+    )
+    await driver.init?.()
+  } else if (
     normDriver === "189" ||
     normDriver === "189cloud" ||
     normDriver === "cloud189" ||
     normDriver === "ctyun" ||
     normDriver === "189pan" ||
-    normDriver === "189cloudpc" ||
     normDriver === "189cloudapp" ||
     normDriver.startsWith("189") ||
     normDriver.includes("cloud189")
@@ -1155,25 +1190,28 @@ async function createDriver(
     await driver.init?.()
   } else if (normDriver === "guangyapan" || normDriver === "guangya") {
     const addition = parseAddition(storageConfig)
-    driver = new GuangYaPanDriver(addition, async (accessToken, refreshToken) => {
-      try {
-        const db = await getDb()
-        const st = (db.storages || []).find(
-          (s: any) => s.id === storageConfig?.id,
-        )
-        if (!st) return
-        const stAddition =
-          typeof st.addition === "string"
-            ? JSON.parse(st.addition || "{}")
-            : st.addition || {}
-        stAddition.access_token = accessToken
-        if (refreshToken) stAddition.refresh_token = refreshToken
-        st.addition = JSON.stringify(stAddition)
-        await saveDb(db)
-      } catch (e) {
-        console.warn("[GuangYaPan] failed to persist tokens:", e)
-      }
-    })
+    driver = new GuangYaPanDriver(
+      addition,
+      async (accessToken, refreshToken) => {
+        try {
+          const db = await getDb()
+          const st = (db.storages || []).find(
+            (s: any) => s.id === storageConfig?.id,
+          )
+          if (!st) return
+          const stAddition =
+            typeof st.addition === "string"
+              ? JSON.parse(st.addition || "{}")
+              : st.addition || {}
+          stAddition.access_token = accessToken
+          if (refreshToken) stAddition.refresh_token = refreshToken
+          st.addition = JSON.stringify(stAddition)
+          await saveDb(db)
+        } catch (e) {
+          console.warn("[GuangYaPan] failed to persist tokens:", e)
+        }
+      },
+    )
     await driver.init?.()
   } else {
     throw new Error(
@@ -1191,8 +1229,8 @@ export async function getDriver(
 ): Promise<StorageDriver> {
   const deferTokenPersistence = Boolean(
     options.deferTokenPersistence &&
-      storageConfig &&
-      typeof storageConfig === "object",
+    storageConfig &&
+    typeof storageConfig === "object",
   )
   if (deferTokenPersistence) deferredTokenPersistence.add(storageConfig)
 
