@@ -134,6 +134,17 @@ export const normalizeDriver = (driverName: string): string => {
   if (norm.startsWith("123")) return "123Pan"
   if (norm.includes("aliyun")) return "AliyundriveOpen"
   if (norm.startsWith("baidu")) return "BaiduNetdisk"
+  // 天翼云盘客户端（PC 协议）与 Web 版 189Cloud 是两套实现，需优先区分
+  if (
+    norm === "189pc" ||
+    norm === "189cloudpc" ||
+    norm === "cloud189pc" ||
+    norm === "189pcloud" ||
+    norm === "189pcclient" ||
+    norm === "189client" ||
+    norm === "ctyunpc"
+  )
+    return "189CloudPC"
   if (
     norm.startsWith("189") ||
     norm.includes("cloud189") ||
@@ -485,59 +496,63 @@ adminRouter.post("/storage/disable", async (c) => {
   return c.json({ code: 200, message: "success", data: null })
 })
 
+/** 「添加存储」页面驱动下拉的候选清单 */
+export const DRIVER_NAMES = [
+  "AliyundriveOpen",
+  "GoogleDrive",
+  "Onedrive",
+  "OnedriveAPP",
+  "Quark",
+  "123Pan",
+  "BaiduNetdisk",
+  "115Open",
+  "GitHub API",
+  "Thunder",
+  "ThunderExpert",
+  "189Cloud",
+  "189CloudPC",
+  "WoPan",
+  "Lanzou",
+  "WebDav",
+  "S3",
+  "Doge",
+  "PikPak",
+  "Seafile",
+  "YandexDisk",
+  "Terabox",
+  "MediaTrack",
+  "Alias",
+  "Dropbox",
+  "WPS",
+  "139Yun",
+  "Mega_nz",
+  "115Share",
+  "123PanShare",
+  "AliyundriveShare",
+  "OnedriveSharelink",
+  "PikPakShare",
+  "SMB",
+  "Crypt",
+  "Virtual",
+  "AListV3",
+  "UrlTree",
+  "Strm",
+  "AzureBlob",
+  "USS",
+  "Alidoc",
+  "Emby",
+  "BunnyStorage",
+  "CloudflareImgbed",
+  "GuangYaPan",
+  "AutoIndex",
+  "ProtonDrive",
+]
+
 adminRouter.get("/driver/names", (c) => {
   return c.json({
     code: 200,
     message: "success",
-    data: [
-      "AliyundriveOpen",
-      "GoogleDrive",
-      "Onedrive",
-      "OnedriveAPP",
-      "Quark",
-      "123Pan",
-      "BaiduNetdisk",
-      "115Open",
-      "GitHub API",
-      "Thunder",
-      "ThunderExpert",
-      "189Cloud",
-      "WoPan",
-      "Lanzou",
-      "WebDav",
-      "S3",
-      "Doge",
-      "PikPak",
-      "Seafile",
-      "YandexDisk",
-      "Terabox",
-      "MediaTrack",
-      "Alias",
-      "Dropbox",
-      "WPS",
-      "139Yun",
-      "Mega_nz",
-      "115Share",
-      "123PanShare",
-      "AliyundriveShare",
-      "OnedriveSharelink",
-      "PikPakShare",
-      "SMB",
-      "Crypt",
-      "Virtual",
-      "AListV3",
-      "UrlTree",
-      "Strm",
-      "AzureBlob",
-      "USS",
-      "Alidoc",
-      "Emby",
-      "BunnyStorage",
-      "CloudflareImgbed",
-      "GuangYaPan",
-      "AutoIndex",
-      "ProtonDrive",
-    ],
+    data: DRIVER_NAMES,
   })
 })
 
@@ -709,7 +724,7 @@ const COMMON_FIELDS = [
   SEED_POLICY_FIELD,
 ]
 
-const driverConfigs: Record<string, any> = {
+export const driverConfigs: Record<string, any> = {
   AliyundriveOpen: {
     name: "AliyundriveOpen",
     default_mount_path: "/aliyundrive",
@@ -1751,6 +1766,102 @@ const driverConfigs: Record<string, any> = {
     config: {
       name: "189Cloud",
       local_sort: true,
+      only_local: false,
+      only_proxy: false,
+      no_cache: false,
+      no_upload: false,
+      need_ms: false,
+      default_root: "-11",
+    },
+  },
+  "189CloudPC": {
+    name: "189CloudPC",
+    default_mount_path: "/189pc",
+    common: [
+      ...BASE_FIELDS,
+      CUSTOM_CACHE_POLICIES_FIELD,
+      ENABLE_SIGN_FIELD,
+      DISABLE_INDEX_FIELD,
+      ...buildProxyFields("189CloudPC"),
+      DISABLE_PROXY_SIGN_FIELD,
+      SEED_POLICY_FIELD,
+    ],
+    // 对齐 Go drivers/189pc/meta.go；移除 TS 版尚未实现的
+    // login_type=qrcode / upload_method / family_transfer / rapid_upload 等项
+    additional: [
+      {
+        name: "username",
+        type: "string",
+        default: "",
+        required: true,
+        help: "the phone number used to log in",
+      },
+      {
+        name: "password",
+        type: "string",
+        default: "",
+        required: true,
+        help: "password for login",
+      },
+      {
+        name: "validate_code",
+        type: "string",
+        default: "",
+        required: false,
+        help: "图片验证码：登录提示 need img validate code 时填写后重新保存",
+      },
+      {
+        name: "root_folder_id",
+        type: "string",
+        default: "-11",
+        required: false,
+        help: "根文件夹ID，默认为 -11（个人云根目录）；家庭云请留空",
+      },
+      {
+        name: "type",
+        type: "select",
+        options: "personal,family",
+        default: "personal",
+        required: false,
+      },
+      {
+        name: "family_id",
+        type: "string",
+        default: "",
+        required: false,
+        help: "家庭云 ID；type=family 且留空时会自动获取",
+      },
+      {
+        name: "order_by",
+        type: "select",
+        options: "filename,filesize,lastOpTime",
+        default: "filename",
+        required: false,
+      },
+      {
+        name: "order_direction",
+        type: "select",
+        options: "asc,desc",
+        default: "asc",
+        required: false,
+      },
+      {
+        name: "access_token",
+        type: "string",
+        default: "",
+        required: false,
+      },
+      {
+        name: "refresh_token",
+        type: "string",
+        default: "",
+        required: false,
+        help: "To switch accounts, please clear this field",
+      },
+    ],
+    config: {
+      name: "189CloudPC",
+      local_sort: false,
       only_local: false,
       only_proxy: false,
       no_cache: false,
